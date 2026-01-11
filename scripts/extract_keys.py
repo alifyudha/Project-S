@@ -8,6 +8,7 @@ import sys
 import concurrent.futures
 import argparse
 import time
+import threading
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -39,6 +40,9 @@ CLEAN_REPO_LIST = [clean_url(url) for url in REPO_LIST]
 OUTPUT_FILE = "decryptionkeys.json"
 STATE_FILE = "scan_state.json"
 TEMP_DIR = "temp_repos"
+
+# Global lock for file operations and key updates
+file_lock = threading.Lock()
 
 def get_keys_from_content(content):
     keys = {}
@@ -74,40 +78,41 @@ def save_keys_to_file(keys):
     """
     Save keys to file atomically.
     """
-    try:
-        # Sort keys for consistent output
-        sorted_keys = dict(sorted(keys.items(), key=lambda item: int(item[0]) if item[0].isdigit() else item[0]))
-        
-        temp_file = OUTPUT_FILE + ".tmp"
-        with open(temp_file, 'w') as f:
-            json.dump(sorted_keys, f, indent=4)
-            
-        shutil.move(temp_file, OUTPUT_FILE)
-        
-        # Git commit and push
+    with file_lock:
         try:
-            files_to_commit = []
-            subprocess.run(["git", "add", OUTPUT_FILE], check=True, capture_output=True)
-            files_to_commit.append(OUTPUT_FILE)
+            # Sort keys for consistent output
+            sorted_keys = dict(sorted(keys.items(), key=lambda item: int(item[0]) if item[0].isdigit() else item[0]))
             
-            if os.path.exists(STATE_FILE):
-                subprocess.run(["git", "add", STATE_FILE], check=True, capture_output=True)
-                files_to_commit.append(STATE_FILE)
-
-            # Check if there are changes
-            status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+            temp_file = OUTPUT_FILE + ".tmp"
+            with open(temp_file, 'w') as f:
+                json.dump(sorted_keys, f, indent=4)
+                
+            shutil.move(temp_file, OUTPUT_FILE)
             
-            has_changes = any(f in status.stdout for f in files_to_commit)
-            
-            if has_changes:
-                subprocess.run(["git", "commit", "-m", f"Auto-update decryption keys ({len(keys)} keys) [skip ci]"], check=True, capture_output=True)
-                subprocess.run(["git", "push"], check=True, capture_output=True)
-                logging.info(f"Pushed updates to GitHub. Total keys: {len(keys)}")
+            # Git commit and push
+            try:
+                files_to_commit = []
+                subprocess.run(["git", "add", OUTPUT_FILE], check=True, capture_output=True)
+                files_to_commit.append(OUTPUT_FILE)
+                
+                if os.path.exists(STATE_FILE):
+                    subprocess.run(["git", "add", STATE_FILE], check=True, capture_output=True)
+                    files_to_commit.append(STATE_FILE)
+    
+                # Check if there are changes
+                status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+                
+                has_changes = any(f in status.stdout for f in files_to_commit)
+                
+                if has_changes:
+                    subprocess.run(["git", "commit", "-m", f"Auto-update decryption keys ({len(keys)} keys) [skip ci]"], check=True, capture_output=True)
+                    subprocess.run(["git", "push"], check=True, capture_output=True)
+                    logging.info(f"Pushed updates to GitHub. Total keys: {len(keys)}")
+            except Exception as e:
+                logging.warning(f"Git push failed: {e}")
+    
         except Exception as e:
-            logging.warning(f"Git push failed: {e}")
-
-    except Exception as e:
-        logging.error(f"Failed to save keys: {e}")
+            logging.error(f"Failed to save keys: {e}")
 
 def process_branch(repo_path, branch):
     """
@@ -225,12 +230,14 @@ def process_repo(repo_url, global_keys, max_workers, last_scan_time=0):
             try:
                 found_keys = future.result()
                 # Merge into global keys (not thread safe if writing directly, but we are in main thread loop here)
-                for appid, key in found_keys.items():
-                    if appid not in global_keys:
-                        global_keys[appid] = key
-                    else:
-                        if key: # Update if we found a key where previously there might be none
+                # However, with repo concurrency, we need to lock
+                with file_lock:
+                    for appid, key in found_keys.items():
+                        if appid not in global_keys:
                             global_keys[appid] = key
+                        else:
+                            if key: # Update if we found a key where previously there might be none
+                                global_keys[appid] = key
             except Exception as e:
                 logging.warning(f"Error processing branch {branch}: {e}")
             
@@ -276,9 +283,20 @@ def main():
     # Start time for this run
     current_run_time = int(time.time())
 
-    for repo in CLEAN_REPO_LIST:
-        process_repo(repo, global_keys, args.workers, last_scan_time)
+    # Process repos in parallel
+    # Default to 4 parallel repos if not specified (hardcoded here or use another arg)
+    REPO_WORKERS = 4 
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=REPO_WORKERS) as repo_executor:
+        future_to_repo = {repo_executor.submit(process_repo, repo, global_keys, args.workers, last_scan_time): repo for repo in CLEAN_REPO_LIST}
         
+        for future in concurrent.futures.as_completed(future_to_repo):
+            repo = future_to_repo[future]
+            try:
+                future.result()
+            except Exception as e:
+                logging.error(f"Repo {repo} failed: {e}")
+
     # Remove temp dir
     force_remove_dir(TEMP_DIR)
     
