@@ -7,6 +7,7 @@ import logging
 import sys
 import concurrent.futures
 import argparse
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -70,6 +71,35 @@ def get_keys_from_content(content):
             
     return keys
 
+def save_keys_to_file(keys):
+    """
+    Save keys to file atomically.
+    """
+    try:
+        # Sort keys for consistent output
+        sorted_keys = dict(sorted(keys.items(), key=lambda item: int(item[0]) if item[0].isdigit() else item[0]))
+        
+        temp_file = OUTPUT_FILE + ".tmp"
+        with open(temp_file, 'w') as f:
+            json.dump(sorted_keys, f, indent=4)
+            
+        shutil.move(temp_file, OUTPUT_FILE)
+        
+        # Git commit and push
+        try:
+            subprocess.run(["git", "add", OUTPUT_FILE], check=True, capture_output=True)
+            # Check if there are changes
+            status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+            if OUTPUT_FILE in status.stdout:
+                subprocess.run(["git", "commit", "-m", f"Auto-update decryption keys ({len(keys)} keys) [skip ci]"], check=True, capture_output=True)
+                subprocess.run(["git", "push"], check=True, capture_output=True)
+                logging.info(f"Pushed updates to GitHub. Total keys: {len(keys)}")
+        except Exception as e:
+            logging.warning(f"Git push failed: {e}")
+
+    except Exception as e:
+        logging.error(f"Failed to save keys: {e}")
+
 def process_branch(repo_path, branch):
     """
     Process a single branch: find lua files and extract keys.
@@ -103,12 +133,32 @@ def process_branch(repo_path, branch):
         
     return branch_keys
 
+def force_remove_dir(dir_path, retries=5, delay=1):
+    """
+    Robustly remove a directory, retrying on failure.
+    """
+    if not os.path.exists(dir_path):
+        return
+
+    for i in range(retries):
+        try:
+            shutil.rmtree(dir_path)
+            return
+        except OSError as e:
+            if i < retries - 1:
+                logging.warning(f"Failed to remove {dir_path} (attempt {i+1}/{retries}): {e}. Retrying in {delay}s...")
+                time.sleep(delay)
+            else:
+                logging.error(f"Failed to remove {dir_path} after {retries} attempts: {e}")
+                # Try to ignore errors as a last resort
+                shutil.rmtree(dir_path, ignore_errors=True)
+
 def process_repo(repo_url, global_keys, max_workers):
     repo_name = repo_url.split('/')[-1].replace('.git', '')
     repo_path = os.path.join(TEMP_DIR, repo_name)
     
-    if os.path.exists(repo_path):
-        shutil.rmtree(repo_path)
+    # Ensure clean slate
+    force_remove_dir(repo_path)
     
     logging.info(f"Cloning {repo_url}...")
     try:
@@ -126,8 +176,7 @@ def process_repo(repo_url, global_keys, max_workers):
         branches = result.stdout.splitlines()
     except subprocess.CalledProcessError as e:
         logging.error(f"Failed to list branches for {repo_name}: {e}")
-        if os.path.exists(repo_path):
-            shutil.rmtree(repo_path)
+        force_remove_dir(repo_path)
         return
 
     logging.info(f"Found {len(branches)} branches in {repo_name}. Processing with {max_workers} threads...")
@@ -156,10 +205,10 @@ def process_repo(repo_url, global_keys, max_workers):
             count += 1
             if count % 1000 == 0:
                 logging.info(f"Processed {count}/{total} branches...")
+                save_keys_to_file(global_keys)
 
     # Cleanup
-    if os.path.exists(repo_path):
-        shutil.rmtree(repo_path)
+    force_remove_dir(repo_path)
     logging.info(f"Finished {repo_name}")
 
 def main():
@@ -176,17 +225,11 @@ def main():
         process_repo(repo, global_keys, args.workers)
         
     # Remove temp dir
-    if os.path.exists(TEMP_DIR):
-        shutil.rmtree(TEMP_DIR)
-        
-    # Write result
+    force_remove_dir(TEMP_DIR)
+    
+    # Final save
     logging.info(f"Writing {len(global_keys)} keys to {OUTPUT_FILE}")
-    
-    # Sort keys for consistent output
-    sorted_keys = dict(sorted(global_keys.items(), key=lambda item: int(item[0]) if item[0].isdigit() else item[0]))
-    
-    with open(OUTPUT_FILE, 'w') as f:
-        json.dump(sorted_keys, f, indent=4)
+    save_keys_to_file(global_keys)
 
 if __name__ == "__main__":
     main()
