@@ -5,9 +5,12 @@ import shutil
 import json
 import logging
 import sys
+import concurrent.futures
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+MAX_WORKERS = 32
 
 REPO_LIST = [
     " `https://github.com/dvahana2424-web/sojogamesdatabase1.git` ",
@@ -68,6 +71,39 @@ def get_keys_from_content(content):
             
     return keys
 
+def process_branch(repo_path, branch):
+    """
+    Process a single branch: find lua files and extract keys.
+    Returns a dictionary of found keys.
+    """
+    branch_keys = {}
+    try:
+        # List files in the branch
+        ls_tree = subprocess.run(["git", "ls-tree", "-r", "--name-only", branch], 
+                                    cwd=repo_path, capture_output=True, text=True)
+        files = ls_tree.stdout.splitlines()
+        lua_files = [f for f in files if f.endswith('.lua')]
+        
+        for lua_file in lua_files:
+            # Read file content
+            show_cmd = subprocess.run(["git", "show", f"{branch}:{lua_file}"], 
+                                        cwd=repo_path, capture_output=True, text=True, errors='ignore')
+            content = show_cmd.stdout
+            found_keys = get_keys_from_content(content)
+            
+            # Merge into branch keys
+            for appid, key in found_keys.items():
+                if appid not in branch_keys:
+                    branch_keys[appid] = key
+                else:
+                    if key:
+                        branch_keys[appid] = key
+    except Exception as e:
+        # Log minimally to avoid spamming if many fail
+        pass
+        
+    return branch_keys
+
 def process_repo(repo_url, global_keys):
     repo_name = repo_url.split('/')[-1].replace('.git', '')
     repo_path = os.path.join(TEMP_DIR, repo_name)
@@ -95,35 +131,32 @@ def process_repo(repo_url, global_keys):
             shutil.rmtree(repo_path)
         return
 
-    logging.info(f"Found {len(branches)} branches in {repo_name}")
+    logging.info(f"Found {len(branches)} branches in {repo_name}. Processing with {MAX_WORKERS} threads...")
     
-    for branch in branches:
-        # Find lua files in the branch
-        try:
-            # List files in the branch
-            ls_tree = subprocess.run(["git", "ls-tree", "-r", "--name-only", branch], 
-                                     cwd=repo_path, capture_output=True, text=True)
-            files = ls_tree.stdout.splitlines()
-            lua_files = [f for f in files if f.endswith('.lua')]
-            
-            for lua_file in lua_files:
-                # Read file content
-                show_cmd = subprocess.run(["git", "show", f"{branch}:{lua_file}"], 
-                                          cwd=repo_path, capture_output=True, text=True, errors='ignore')
-                content = show_cmd.stdout
-                found_keys = get_keys_from_content(content)
-                
-                # Merge into global keys
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all branch tasks
+        future_to_branch = {executor.submit(process_branch, repo_path, branch): branch for branch in branches}
+        
+        count = 0
+        total = len(branches)
+        
+        for future in concurrent.futures.as_completed(future_to_branch):
+            branch = future_to_branch[future]
+            try:
+                found_keys = future.result()
+                # Merge into global keys (not thread safe if writing directly, but we are in main thread loop here)
                 for appid, key in found_keys.items():
                     if appid not in global_keys:
                         global_keys[appid] = key
                     else:
-                        if key:
+                        if key: # Update if we found a key where previously there might be none
                             global_keys[appid] = key
-                            
-        except Exception as e:
-            logging.warning(f"Error processing branch {branch} in {repo_name}: {e}")
-            continue
+            except Exception as e:
+                logging.warning(f"Error processing branch {branch}: {e}")
+            
+            count += 1
+            if count % 1000 == 0:
+                logging.info(f"Processed {count}/{total} branches...")
 
     # Cleanup
     if os.path.exists(repo_path):
