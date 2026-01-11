@@ -221,6 +221,15 @@ def main():
         
     global_keys = {}
     
+    # Load existing keys if file exists
+    if os.path.exists(OUTPUT_FILE):
+        try:
+            with open(OUTPUT_FILE, 'r') as f:
+                global_keys = json.load(f)
+            logging.info(f"Loaded {len(global_keys)} existing keys from {OUTPUT_FILE}")
+        except Exception as e:
+            logging.warning(f"Failed to load existing keys: {e}")
+
     for repo in CLEAN_REPO_LIST:
         process_repo(repo, global_keys, args.workers)
         
