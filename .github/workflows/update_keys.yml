@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '0 0 * * *' # Run daily at midnight
   workflow_dispatch: # Allow manual trigger
+    inputs:
+      max_workers:
+        description: 'Number of worker threads for concurrency'
+        required: false
+        default: '32'
+        type: string
 
 permissions:
   contents: write
@@ -22,7 +28,7 @@ jobs:
         python-version: '3.x'
 
     - name: Run extraction script
-      run: python scripts/extract_keys.py
+      run: python scripts/extract_keys.py --workers ${{ inputs.max_workers || 32 }}
 
     - name: Commit and push changes
       run: |

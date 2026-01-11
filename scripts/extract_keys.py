@@ -6,11 +6,10 @@ import json
 import logging
 import sys
 import concurrent.futures
+import argparse
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-MAX_WORKERS = 32
 
 REPO_LIST = [
     " `https://github.com/dvahana2424-web/sojogamesdatabase1.git` ",
@@ -104,7 +103,7 @@ def process_branch(repo_path, branch):
         
     return branch_keys
 
-def process_repo(repo_url, global_keys):
+def process_repo(repo_url, global_keys, max_workers):
     repo_name = repo_url.split('/')[-1].replace('.git', '')
     repo_path = os.path.join(TEMP_DIR, repo_name)
     
@@ -131,9 +130,9 @@ def process_repo(repo_url, global_keys):
             shutil.rmtree(repo_path)
         return
 
-    logging.info(f"Found {len(branches)} branches in {repo_name}. Processing with {MAX_WORKERS} threads...")
+    logging.info(f"Found {len(branches)} branches in {repo_name}. Processing with {max_workers} threads...")
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all branch tasks
         future_to_branch = {executor.submit(process_branch, repo_path, branch): branch for branch in branches}
         
@@ -164,13 +163,17 @@ def process_repo(repo_url, global_keys):
     logging.info(f"Finished {repo_name}")
 
 def main():
+    parser = argparse.ArgumentParser(description="Extract decryption keys from Steam manifest repositories.")
+    parser.add_argument("--workers", type=int, default=32, help="Number of threads for concurrent branch processing")
+    args = parser.parse_args()
+    
     if not os.path.exists(TEMP_DIR):
         os.makedirs(TEMP_DIR)
         
     global_keys = {}
     
     for repo in CLEAN_REPO_LIST:
-        process_repo(repo, global_keys)
+        process_repo(repo, global_keys, args.workers)
         
     # Remove temp dir
     if os.path.exists(TEMP_DIR):
