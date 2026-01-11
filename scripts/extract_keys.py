@@ -39,6 +39,7 @@ def clean_url(url):
 CLEAN_REPO_LIST = [clean_url(url) for url in REPO_LIST]
 
 OUTPUT_FILE = "decryptionkeys.json"
+STATE_FILE = "scan_state.json"
 TEMP_DIR = "temp_repos"
 
 def get_keys_from_content(content):
@@ -87,10 +88,20 @@ def save_keys_to_file(keys):
         
         # Git commit and push
         try:
+            files_to_commit = []
             subprocess.run(["git", "add", OUTPUT_FILE], check=True, capture_output=True)
+            files_to_commit.append(OUTPUT_FILE)
+            
+            if os.path.exists(STATE_FILE):
+                subprocess.run(["git", "add", STATE_FILE], check=True, capture_output=True)
+                files_to_commit.append(STATE_FILE)
+
             # Check if there are changes
             status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
-            if OUTPUT_FILE in status.stdout:
+            
+            has_changes = any(f in status.stdout for f in files_to_commit)
+            
+            if has_changes:
                 subprocess.run(["git", "commit", "-m", f"Auto-update decryption keys ({len(keys)} keys) [skip ci]"], check=True, capture_output=True)
                 subprocess.run(["git", "push"], check=True, capture_output=True)
                 logging.info(f"Pushed updates to GitHub. Total keys: {len(keys)}")
@@ -153,7 +164,7 @@ def force_remove_dir(dir_path, retries=5, delay=1):
                 # Try to ignore errors as a last resort
                 shutil.rmtree(dir_path, ignore_errors=True)
 
-def process_repo(repo_url, global_keys, max_workers):
+def process_repo(repo_url, global_keys, max_workers, last_scan_time=0):
     repo_name = repo_url.split('/')[-1].replace('.git', '')
     repo_path = os.path.join(TEMP_DIR, repo_name)
     
@@ -169,24 +180,47 @@ def process_repo(repo_url, global_keys, max_workers):
         logging.error(f"Failed to clone {repo_url}: {e}")
         return
 
-    # List all branches
+    # List all branches with committer date
+    # Format: %(refname:short)|%(committerdate:unix)
     try:
-        result = subprocess.run(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads"], 
+        result = subprocess.run(["git", "for-each-ref", "--format=%(refname:short)|%(committerdate:unix)", "refs/heads"], 
                                 cwd=repo_path, capture_output=True, text=True, check=True)
-        branches = result.stdout.splitlines()
+        raw_branches = result.stdout.splitlines()
     except subprocess.CalledProcessError as e:
         logging.error(f"Failed to list branches for {repo_name}: {e}")
         force_remove_dir(repo_path)
         return
 
-    logging.info(f"Found {len(branches)} branches in {repo_name}. Processing with {max_workers} threads...")
+    # Filter branches based on last scan time
+    branches_to_process = []
+    skipped_count = 0
     
+    for line in raw_branches:
+        try:
+            parts = line.split('|')
+            if len(parts) == 2:
+                branch_name = parts[0]
+                commit_time = int(parts[1])
+                
+                if commit_time > last_scan_time:
+                    branches_to_process.append(branch_name)
+                else:
+                    skipped_count += 1
+        except ValueError:
+            continue
+
+    logging.info(f"Found {len(branches_to_process)} modified branches (skipped {skipped_count} old branches) in {repo_name}. Processing with {max_workers} threads...")
+    
+    if not branches_to_process:
+        force_remove_dir(repo_path)
+        return
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all branch tasks
-        future_to_branch = {executor.submit(process_branch, repo_path, branch): branch for branch in branches}
+        future_to_branch = {executor.submit(process_branch, repo_path, branch): branch for branch in branches_to_process}
         
         count = 0
-        total = len(branches)
+        total = len(branches_to_process)
         
         for future in concurrent.futures.as_completed(future_to_branch):
             branch = future_to_branch[future]
@@ -220,6 +254,17 @@ def main():
         os.makedirs(TEMP_DIR)
         
     global_keys = {}
+    last_scan_time = 0
+
+    # Load state if exists
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r') as f:
+                state = json.load(f)
+                last_scan_time = state.get("last_scan_time", 0)
+            logging.info(f"Loaded last scan time: {last_scan_time}")
+        except Exception as e:
+            logging.warning(f"Failed to load state: {e}")
     
     # Load existing keys if file exists
     if os.path.exists(OUTPUT_FILE):
@@ -230,8 +275,11 @@ def main():
         except Exception as e:
             logging.warning(f"Failed to load existing keys: {e}")
 
+    # Start time for this run
+    current_run_time = int(time.time())
+
     for repo in CLEAN_REPO_LIST:
-        process_repo(repo, global_keys, args.workers)
+        process_repo(repo, global_keys, args.workers, last_scan_time)
         
     # Remove temp dir
     force_remove_dir(TEMP_DIR)
@@ -239,6 +287,14 @@ def main():
     # Final save
     logging.info(f"Writing {len(global_keys)} keys to {OUTPUT_FILE}")
     save_keys_to_file(global_keys)
+    
+    # Save new state
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump({"last_scan_time": current_run_time}, f)
+        logging.info("Saved scan state.")
+    except Exception as e:
+        logging.error(f"Failed to save state: {e}")
 
 if __name__ == "__main__":
     main()
