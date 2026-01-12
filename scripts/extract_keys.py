@@ -74,7 +74,15 @@ def get_keys_from_content(content):
             
     return keys
 
-def save_keys_to_file(keys):
+def save_state(current_run_time):
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump({"last_scan_time": current_run_time}, f)
+        logging.info("Saved scan state.")
+    except Exception as e:
+        logging.error(f"Failed to save state: {e}")
+
+def save_keys_to_file(keys, current_run_time=None):
     """
     Save keys to file atomically.
     """
@@ -89,12 +97,17 @@ def save_keys_to_file(keys):
                 
             shutil.move(temp_file, OUTPUT_FILE)
             
+            # Save state if time provided
+            if current_run_time:
+                save_state(current_run_time)
+            
             # Git commit and push
             try:
                 files_to_commit = []
                 subprocess.run(["git", "add", OUTPUT_FILE], check=True, capture_output=True)
                 files_to_commit.append(OUTPUT_FILE)
                 
+                # Always try to add state file if it exists
                 if os.path.exists(STATE_FILE):
                     subprocess.run(["git", "add", STATE_FILE], check=True, capture_output=True)
                     files_to_commit.append(STATE_FILE)
@@ -244,6 +257,7 @@ def process_repo(repo_url, global_keys, max_workers, last_scan_time=0):
             count += 1
             if count % 1000 == 0:
                 logging.info(f"Processed {count}/{total} branches...")
+                # We don't save state here, only keys, to avoid partial state updates
                 save_keys_to_file(global_keys)
 
     # Cleanup
@@ -252,7 +266,8 @@ def process_repo(repo_url, global_keys, max_workers, last_scan_time=0):
 
 def main():
     parser = argparse.ArgumentParser(description="Extract decryption keys from Steam manifest repositories.")
-    parser.add_argument("--workers", type=int, default=32, help="Number of threads for concurrent branch processing")
+    parser.add_argument("--workers", type=int, default=32, help="Number of threads for concurrent branch processing per repo")
+    parser.add_argument("--repo-workers", type=int, default=4, help="Number of concurrent repositories to process")
     args = parser.parse_args()
     
     if not os.path.exists(TEMP_DIR):
@@ -285,7 +300,7 @@ def main():
 
     # Process repos in parallel
     # Default to 4 parallel repos if not specified (hardcoded here or use another arg)
-    REPO_WORKERS = 4 
+    REPO_WORKERS = args.repo_workers
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=REPO_WORKERS) as repo_executor:
         future_to_repo = {repo_executor.submit(process_repo, repo, global_keys, args.workers, last_scan_time): repo for repo in CLEAN_REPO_LIST}
@@ -300,17 +315,9 @@ def main():
     # Remove temp dir
     force_remove_dir(TEMP_DIR)
     
-    # Final save
+    # Final save with state update
     logging.info(f"Writing {len(global_keys)} keys to {OUTPUT_FILE}")
-    save_keys_to_file(global_keys)
-    
-    # Save new state
-    try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump({"last_scan_time": current_run_time}, f)
-        logging.info("Saved scan state.")
-    except Exception as e:
-        logging.error(f"Failed to save state: {e}")
+    save_keys_to_file(global_keys, current_run_time)
 
 if __name__ == "__main__":
     main()
