@@ -252,11 +252,11 @@ def process_repo(repo_url, global_keys, max_workers, last_scan_time=0):
                             if key: # Update if we found a key where previously there might be none
                                 global_keys[appid] = key
             except Exception as e:
-                logging.warning(f"Error processing branch {branch}: {e}")
+                logging.warning(f"[{repo_name}] Error processing branch {branch}: {e}")
             
             count += 1
             if count % 1000 == 0:
-                logging.info(f"Processed {count}/{total} branches...")
+                logging.info(f"[{repo_name}] Processed {count}/{total} branches...")
                 # We don't save state here, only keys, to avoid partial state updates
                 save_keys_to_file(global_keys)
 
@@ -285,6 +285,14 @@ def main():
             logging.info(f"Loaded last scan time: {last_scan_time}")
         except Exception as e:
             logging.warning(f"Failed to load state: {e}")
+    else:
+        # Create initial state file if it doesn't exist
+        try:
+            with open(STATE_FILE, 'w') as f:
+                json.dump({"last_scan_time": 0}, f)
+            logging.info("Created initial scan_state.json")
+        except Exception as e:
+            logging.warning(f"Failed to create initial state file: {e}")
     
     # Load existing keys if file exists
     if os.path.exists(OUTPUT_FILE):
